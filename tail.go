@@ -25,6 +25,9 @@ import (
 	"github.com/SEKOIA-IO/tail/util"
 	"github.com/SEKOIA-IO/tail/watch"
 	"gopkg.in/tomb.v1"
+
+	"golang.org/x/text/encoding/ianaindex"
+	"golang.org/x/text/transform"
 )
 
 var (
@@ -79,6 +82,8 @@ type Config struct {
 	// Optionally use a Logger. When nil, the Logger is set to tail.DefaultLogger.
 	// To disable logging, set it to tail.DiscardingLogger
 	Logger logger
+
+	Encoding string // The encoding of the file. If empty, UTF-8 is assumed
 }
 
 type Tail struct {
@@ -141,6 +146,13 @@ func TailFile(filename string, config Config) (*Tail, error) {
 	if t.MustExist {
 		var err error
 		t.file, err = OpenFile(t.Filename)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if config.Encoding != "" {
+		// Make sure a decoder exists for this encoding
+		_, err := ianaindex.IANA.Encoding(config.Encoding)
 		if err != nil {
 			return nil, err
 		}
@@ -408,13 +420,24 @@ func (tail *Tail) waitForChanges() error {
 
 func (tail *Tail) openReader() {
 	tail.lk.Lock()
+	transformReader := tail.getTransformReader()
 	if tail.MaxLineSize > 0 {
 		// add 2 to account for newline characters
-		tail.reader = bufio.NewReaderSize(tail.file, tail.MaxLineSize+2)
+		tail.reader = bufio.NewReaderSize(transformReader, tail.MaxLineSize+2)
 	} else {
-		tail.reader = bufio.NewReader(tail.file)
+		tail.reader = bufio.NewReader(transformReader)
 	}
 	tail.lk.Unlock()
+}
+
+func (tail *Tail) getTransformReader() io.Reader {
+	if tail.Encoding == "" || strings.ToUpper(tail.Encoding) == "UTF-8" {
+		// No need for a transformer
+		return tail.file
+	}
+	encode, _ := ianaindex.IANA.Encoding(tail.Encoding)
+	reader := transform.NewReader(tail.file, encode.NewDecoder())
+	return reader
 }
 
 func (tail *Tail) seekEnd() error {
