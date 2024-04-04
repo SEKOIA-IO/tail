@@ -7,4 +7,7 @@ require (
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7
 )
 
-require golang.org/x/sys v0.10.0 // indirect
+require (
+	golang.org/x/sys v0.10.0 // indirect
+	golang.org/x/text v0.14.0
+)
