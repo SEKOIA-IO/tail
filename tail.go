@@ -26,6 +26,7 @@ import (
 	"github.com/SEKOIA-IO/tail/watch"
 	"gopkg.in/tomb.v1"
 
+	"github.com/gogs/chardet"
 	"golang.org/x/text/encoding/ianaindex"
 	"golang.org/x/text/transform"
 )
@@ -431,13 +432,38 @@ func (tail *Tail) openReader() {
 }
 
 func (tail *Tail) getTransformReader() io.Reader {
-	if tail.Encoding == "" || strings.ToUpper(tail.Encoding) == "UTF-8" {
+	encoding := tail.getEncoding()
+	if strings.ToUpper(encoding) == "UTF-8" {
 		// No need for a transformer
 		return tail.file
 	}
-	encode, _ := ianaindex.IANA.Encoding(tail.Encoding)
+	encode, _ := ianaindex.IANA.Encoding(encoding)
 	reader := transform.NewReader(tail.file, encode.NewDecoder())
 	return reader
+}
+
+func (tail *Tail) getEncoding() string {
+	if tail.Encoding != "" {
+		return tail.Encoding
+	}
+	// Detect encoding
+	currentOffset, err := tail.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "UTF-8"
+	}
+	tail.file.Seek(0, io.SeekStart)
+	buf := make([]byte, 1024)
+	_, err = tail.file.Read(buf)
+	tail.file.Seek(currentOffset, io.SeekStart)
+	if err != nil {
+		return "UTF-8"
+	}
+	detector := chardet.NewTextDetector()
+	result, err := detector.DetectBest(buf)
+	if err != nil || result.Confidence < 80 {
+		return "UTF-8"
+	}
+	return result.Charset
 }
 
 func (tail *Tail) seekEnd() error {
