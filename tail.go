@@ -437,7 +437,10 @@ func (tail *Tail) getTransformReader() io.Reader {
 		// No need for a transformer
 		return tail.file
 	}
-	encode, _ := ianaindex.IANA.Encoding(encoding)
+	encode, err := ianaindex.IANA.Encoding(encoding)
+	if err != nil || encode == nil {
+		return tail.file
+	}
 	reader := transform.NewReader(tail.file, encode.NewDecoder())
 	return reader
 }
