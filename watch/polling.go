@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/SEKOIA-IO/tail/util"
 	"gopkg.in/tomb.v1"
 )
 
@@ -43,8 +42,14 @@ func (fw *PollingFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
 	panic("unreachable")
 }
 
+// Number of consecutive failed polls tolerated before the file is reported as
+// deleted. Stat errors can be transient (antivirus or backup software briefly
+// locking the file); reporting a deletion too eagerly makes the tail reopen the
+// file and read it again from the start.
+const maxConsecutiveStatErrors = 40
+
 func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChanges, error) {
-	origFi, err := os.Stat(fw.Filename)
+	origFi, err := statFile(fw.Filename)
 	if err != nil {
 		return nil, err
 	}
@@ -59,6 +64,7 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChange
 
 	go func() {
 		prevSize := fw.Size
+		consecutiveStatErrors := 0
 		for {
 			select {
 			case <-t.Dying():
@@ -67,7 +73,7 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChange
 			}
 
 			time.Sleep(POLL_DURATION)
-			fi, err := os.Stat(fw.Filename)
+			fi, err := statFile(fw.Filename)
 			if err != nil {
 				// Windows cannot delete a file if a handle is still open (tail keeps one open)
 				// so it gives access denied to anything trying to read it until all handles are released.
@@ -77,9 +83,18 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChange
 					return
 				}
 
-				// XXX: report this error back to the user
-				util.Fatal("Failed to stat file %v: %v", fw.Filename, err)
+				// Any other stat error used to be fatal (os.Exit from this
+				// goroutine, killing the whole process). Tolerate transient
+				// errors, then report the file as deleted so the tail tries
+				// to reopen it instead of dying.
+				consecutiveStatErrors++
+				if consecutiveStatErrors >= maxConsecutiveStatErrors {
+					changes.NotifyDeleted()
+					return
+				}
+				continue
 			}
+			consecutiveStatErrors = 0
 
 			// File got moved/renamed?
 			if !os.SameFile(origFi, fi) {
