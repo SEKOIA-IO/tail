@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/SEKOIA-IO/tail/util"
 	"gopkg.in/tomb.v1"
 )
 
@@ -83,12 +84,14 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChange
 					return
 				}
 
-				// Any other stat error used to be fatal (os.Exit from this
-				// goroutine, killing the whole process). Tolerate transient
-				// errors, then report the file as deleted so the tail tries
-				// to reopen it instead of dying.
+				// Tolerate transient errors, then report the file as deleted
+				// so the tail tries to reopen it instead of dying.
+				if consecutiveStatErrors == 0 {
+					util.LOGGER.Printf("Unexpected error while polling %s: %s", fw.Filename, err)
+				}
 				consecutiveStatErrors++
 				if consecutiveStatErrors >= maxConsecutiveStatErrors {
+					util.LOGGER.Printf("Still unable to poll %s after %d attempts (%s), reporting it as deleted to trigger a reopen", fw.Filename, consecutiveStatErrors, err)
 					changes.NotifyDeleted()
 					return
 				}
