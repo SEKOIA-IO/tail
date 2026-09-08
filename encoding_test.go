@@ -319,6 +319,111 @@ func TestUTF8WithoutBOMLosesNothing(t *testing.T) {
 	}
 }
 
+// TestShortFirstLineIsNotWithheld checks that a followed stream whose beginning
+// is shorter than a byte order mark is decoded right away.
+//
+// unicode.BOMOverride withholds the first three bytes of a stream while it
+// decides whether they begin a mark. Wrapping a file that carries no mark, where
+// the override has nothing to do anyway, made a complete first line of one or
+// two bytes sit in the decoder until a third byte was written. On a named pipe,
+// whose writer can stay open indefinitely, the line never came out at all.
+func TestShortFirstLineIsNotWithheld(t *testing.T) {
+	testCases := []struct {
+		name     string
+		encoding string
+		content  []byte
+		expected string
+	}{
+		{"one byte and a newline", "ISO-8859-1", encodeLatin1(t, "a\n"), "a"},
+		{"a bare newline", "ISO-8859-1", encodeLatin1(t, "\n"), ""},
+		{"a mark-like first byte", "ISO-8859-1", []byte{0xFF, '\n'}, "\u00ff"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("short-first-line", t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log", testCase.content)
+			// Follow, so that the end of the file is not the end of the data and
+			// the decoder is never told that no more bytes will come
+			tail := newUnstartedTail(t, tailTest.path+"/test.log",
+				Config{Encoding: testCase.encoding, Follow: true})
+			tail.openReader()
+
+			line, err := tail.readLine()
+			if err != nil {
+				t.Fatalf("expecting <<<%s>>> straight away, but got <<<%s>>> (error: %v)",
+					testCase.expected, line, err)
+			}
+			if line != testCase.expected {
+				t.Fatalf("expecting <<<%s>>>, but got <<<%s>>> (bytes: %v)",
+					testCase.expected, line, []byte(line))
+			}
+		})
+	}
+}
+
+// TestBOMDecidesTheEncodingWhenResuming checks that the byte order mark of the
+// file settles the encoding wherever the reader is built, and not only at the
+// beginning of the file.
+//
+// unicode.BOMOverride is only applied at offset 0, because mark-like bytes found
+// anywhere else are ordinary content. A reader built further in, which is what
+// every resumed tailing does, therefore used to fall back to the configured
+// encoding: a UTF-16BE file tailed as UTF-16LE decoded correctly until the first
+// resume, then byte-swapped every character. Worse, a misaligned UTF-16 stream
+// holds no line ending at all, so the file went silent instead of looking wrong.
+func TestBOMDecidesTheEncodingWhenResuming(t *testing.T) {
+	testCases := []struct {
+		name       string
+		endianness unicode.Endianness
+		// encoding is what the configuration says, and it disagrees with, or is
+		// less precise than, the mark the file actually carries
+		encoding string
+	}{
+		{"big endian file tailed as little endian", unicode.BigEndian, "UTF-16LE"},
+		{"little endian file tailed as big endian", unicode.LittleEndian, "UTF-16BE"},
+		{"big endian file tailed as plain utf-16", unicode.BigEndian, "UTF-16"},
+		{"little endian file tailed as plain utf-16", unicode.LittleEndian, "UTF-16"},
+		{"little endian file with a detected encoding", unicode.LittleEndian, ""},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("bom-decides-encoding", t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log",
+				encodeUTF16(t, "hello\nworld\n", testCase.endianness, true))
+
+			// Read the first line, and note where the tailing could be resumed
+			tail := newUnstartedTail(t, tailTest.path+"/test.log", Config{Encoding: testCase.encoding})
+			tail.openReader()
+			if line, err := tail.readLine(); err != nil || line != "hello" {
+				t.Fatalf("expecting <<<hello>>>, but got <<<%s>>> (error: %v)", line, err)
+			}
+			offset, err := tail.Tell()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Resume there, the way a restarted consumer does
+			resumed := newUnstartedTail(t, tailTest.path+"/test.log", Config{Encoding: testCase.encoding})
+			if _, err := resumed.file.Seek(offset, io.SeekStart); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			resumed.openReader()
+
+			line, err := resumed.readLine()
+			if err != nil || line != "world" {
+				t.Fatalf("expecting <<<world>>> after resuming at %d, but got <<<%s>>> (bytes: %v, error: %v)",
+					offset, line, []byte(line), err)
+			}
+		})
+	}
+}
+
 // TestMarkLikeBytesAreKeptWhenResuming checks that bytes that look like a byte
 // order mark are treated as ordinary content when the reader is built further in
 // the file, which is what happens every time the tailing resumes at a stored

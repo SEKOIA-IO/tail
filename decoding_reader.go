@@ -92,7 +92,7 @@ func (reader *decodingReader) ReadString(delim byte) (string, error) {
 		n, err := reader.source.Read(reader.readBuffer)
 		if n > 0 {
 			reader.undecoded = append(reader.undecoded, reader.readBuffer[:n]...)
-			if decodeErr := reader.decode(); decodeErr != nil {
+			if decodeErr := reader.decode(false); decodeErr != nil {
 				return "", decodeErr
 			}
 			continue
@@ -105,7 +105,7 @@ func (reader *decodingReader) ReadString(delim byte) (string, error) {
 			// hands over the bytes it was keeping back, and look for a delimiter
 			// in what it produces
 			reader.flushed = true
-			if flushErr := reader.flush(); flushErr != nil {
+			if flushErr := reader.decode(true); flushErr != nil {
 				return "", flushErr
 			}
 			continue
@@ -119,12 +119,21 @@ func (reader *decodingReader) ReadString(delim byte) (string, error) {
 
 // decode transforms as many of the bytes read from the file as possible,
 // keeping the trailing bytes that do not form a complete character yet.
-func (reader *decodingReader) decode() error {
+//
+// While the file is still being written, atEOF is false: an incomplete sequence
+// means "the writer has not finished yet", and must not be flushed as a U+FFFD
+// character.
+//
+// atEOF tells the decoder that no more bytes will ever come, which makes it hand
+// over the bytes it was keeping back. A transformer is allowed to hold bytes for
+// as long as it has not been told that: unicode.BOMOverride, for example, holds
+// the first two bytes of a file while it decides whether they are the beginning
+// of a byte order mark, so a file of one or two bytes would never produce
+// anything at all. An incomplete character at the end of the file then becomes a
+// U+FFFD, which is what tells the reader of the log that the file was truncated.
+func (reader *decodingReader) decode(atEOF bool) error {
 	for len(reader.undecoded) > 0 {
-		// atEOF is always false: the file is still being written, so an
-		// incomplete sequence means "the writer has not finished yet", it must
-		// not be flushed as a U+FFFD character
-		nDst, nSrc, err := reader.decoder.Transform(reader.decodeBuffer, reader.undecoded, false)
+		nDst, nSrc, err := reader.decoder.Transform(reader.decodeBuffer, reader.undecoded, atEOF)
 		if nDst > 0 {
 			reader.decoded = append(reader.decoded, reader.decodeBuffer[:nDst]...)
 		}
@@ -155,43 +164,6 @@ func (reader *decodingReader) decode() error {
 	return nil
 }
 
-// flush decodes the bytes the decoder was keeping back, telling it that the end
-// of the file has been reached.
-//
-// A transformer is allowed to hold bytes for as long as it has not been told
-// that no more will come: unicode.BOMOverride, for example, holds the first two
-// bytes of a file while it decides whether they are the beginning of a byte
-// order mark, so a file of one or two bytes would never produce anything at all.
-// An incomplete character at the end of the file becomes a U+FFFD, which is what
-// tells the reader of the log that the file was truncated.
-func (reader *decodingReader) flush() error {
-	for len(reader.undecoded) > 0 {
-		nDst, nSrc, err := reader.decoder.Transform(reader.decodeBuffer, reader.undecoded, true)
-		if nDst > 0 {
-			reader.decoded = append(reader.decoded, reader.decodeBuffer[:nDst]...)
-		}
-		if nSrc > 0 {
-			reader.unaccounted = append(reader.unaccounted, reader.undecoded[:nSrc]...)
-			reader.undecoded = consume(reader.undecoded, nSrc)
-		}
-
-		switch err {
-		case nil, transform.ErrShortSrc:
-			// Either everything was decoded, or what is left cannot be decoded
-			// even at the end of the file: there is nothing more to get
-			return nil
-		case transform.ErrShortDst:
-			if nDst == 0 && nSrc == 0 {
-				return err
-			}
-		default:
-			return err
-		}
-	}
-
-	return nil
-}
-
 // take returns the first count decoded bytes and accounts for the source bytes
 // they were made of.
 func (reader *decodingReader) take(count int) string {
@@ -203,9 +175,9 @@ func (reader *decodingReader) take(count int) string {
 	reader.account(count)
 
 	reader.decoded = consume(reader.decoded, count)
-	if reader.searched -= count; reader.searched < 0 {
-		reader.searched = 0
-	}
+	// Every call drains the decoded bytes up to at least the searched prefix, so
+	// nothing scanned so far is left
+	reader.searched = 0
 
 	return line
 }

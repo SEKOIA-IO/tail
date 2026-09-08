@@ -53,6 +53,19 @@ const (
 // UTF-8 having a single byte order, but Windows editors and PowerShell write it.
 var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
+// bomEncodings maps the byte order marks that unicode.BOMOverride recognizes to
+// the IANA name of the encoding they announce. The list is deliberately the same
+// as BOMOverride's, so that a reader built in the middle of a file decodes it
+// exactly like a reader built at its beginning.
+var bomEncodings = []struct {
+	mark     []byte
+	encoding string
+}{
+	{utf8BOM, "UTF-8"},
+	{[]byte{0xFE, 0xFF}, "UTF-16BE"},
+	{[]byte{0xFF, 0xFE}, "UTF-16LE"},
+}
+
 type Line struct {
 	Text     string    // The contents of the file
 	Num      int       // The line number
@@ -369,15 +382,11 @@ func (tail *Tail) tailFileSync() {
 				}
 			}
 		} else if err == io.EOF {
-			if !tail.Follow {
-				if line != "" {
-					tail.sendLine(line)
-				}
-				return
-			}
-
-			if tail.Follow && line != "" {
+			if line != "" {
 				tail.sendLine(line)
+			}
+			if !tail.Follow {
+				return
 			}
 
 			// When EOF is reached, wait for more data to become
@@ -513,6 +522,32 @@ func (tail *Tail) atStartOfFile() bool {
 	return position == 0
 }
 
+// encodingFromBOM returns the encoding announced by the byte order mark at the
+// very beginning of the file, or an empty string when the file does not start
+// with one that is recognized.
+//
+// The mark is read at offset 0 with ReadAt, which leaves the position of the
+// file untouched, so the answer does not depend on where the reader is being
+// built. That is what lets a reader opened in the middle of the file, on a
+// resumed tailing, decode it the way the reader opened at its beginning did:
+// unicode.BOMOverride can only act on a mark it is handed, and a decoder built
+// further in is never handed one.
+func (tail *Tail) encodingFromBOM() string {
+	var prefix [3]byte
+	n, err := tail.file.ReadAt(prefix[:], 0)
+	if err != nil && err != io.EOF {
+		// A stream that cannot be read at an offset, a pipe for example, has no
+		// mark to look at
+		return ""
+	}
+	for _, bom := range bomEncodings {
+		if n >= len(bom.mark) && bytes.Equal(prefix[:len(bom.mark)], bom.mark) {
+			return bom.encoding
+		}
+	}
+	return ""
+}
+
 // newDecoders returns the decoders the decoding reader needs, or nil when the
 // file is UTF-8 encoded, or cannot be decoded, and must be read as-is.
 //
@@ -520,6 +555,18 @@ func (tail *Tail) atStartOfFile() bool {
 // other lags behind to count the source bytes of the lines that were returned.
 func (tail *Tail) newDecoders() (decoder, accountant transform.Transformer) {
 	encoding := tail.getEncoding()
+
+	// A byte order mark is written by the producer of the file, so it outranks a
+	// configured or detected encoding that disagrees with it, and it is the only
+	// thing that tells the two byte orders of UTF-16 apart. Resolving it here,
+	// rather than leaving it to unicode.BOMOverride below, is what makes the
+	// answer the same at every position of the file: the override is only
+	// applied at the beginning, where the mark is there to be read.
+	fromBOM := tail.encodingFromBOM()
+	if fromBOM != "" {
+		encoding = fromBOM
+	}
+
 	if strings.ToUpper(encoding) == defaultEncoding {
 		// No need for a transformer
 		return nil, nil
@@ -538,13 +585,13 @@ func (tail *Tail) newDecoders() (decoder, accountant transform.Transformer) {
 	}
 
 	// BOMOverride drops the byte order mark of the file, if any, instead of
-	// decoding it as a U+FEFF character prepended to the first line. It also
-	// corrects the endianness when the mark disagrees with the given encoding.
+	// decoding it as a U+FEFF character prepended to the first line. The
+	// endianness it would also correct has already been settled above, from the
+	// mark itself.
 	//
-	// It is only applied at the start of the file: a decoder built further in,
-	// on a resumed tailing for example, would drop content, and could switch to
-	// a completely different encoding for the rest of the file.
-	if !tail.atStartOfFile() {
+	// It is only applied when there is a mark to drop,
+	// and only at the start of the file.
+	if fromBOM == "" || !tail.atStartOfFile() {
 		return encode.NewDecoder(), encode.NewDecoder()
 	}
 	return unicode.BOMOverride(encode.NewDecoder()), unicode.BOMOverride(encode.NewDecoder())
@@ -558,17 +605,11 @@ func (tail *Tail) getEncoding() string {
 	if tail.detectedEncoding != "" {
 		return tail.detectedEncoding
 	}
-	// Detect encoding
-	currentOffset, err := tail.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return defaultEncoding
-	}
-	tail.file.Seek(0, io.SeekStart)
+	// Detect encoding. ReadAt leaves the position of the file untouched, so the
+	// reader that is being built still starts where it is supposed to.
 	buf := make([]byte, 1024)
-	// A single Read may return less than the whole buffer, even on a large file
-	n, err := io.ReadFull(tail.file, buf)
-	tail.file.Seek(currentOffset, io.SeekStart)
-	if err != nil && err != io.ErrUnexpectedEOF {
+	n, err := tail.file.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
 		return defaultEncoding
 	}
 	if n < minimumDetectionSample {
