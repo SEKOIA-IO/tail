@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -28,12 +27,25 @@ import (
 
 	"github.com/gogs/chardet"
 	"golang.org/x/text/encoding/ianaindex"
+	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 )
 
 var (
 	// ErrStop is returned when the tail of a file has been marked to be stopped.
 	ErrStop = errors.New("tail should now stop")
+)
+
+const (
+	// defaultEncoding is used when no encoding is configured and none could be detected
+	defaultEncoding = "UTF-8"
+	// minimumDetectionSample is the number of bytes below which no detection is
+	// attempted. Two bytes are enough to identify a file that only contains a
+	// byte order mark, as a freshly rotated UTF-16 log file does.
+	minimumDetectionSample = 2
+	// detectionConfidenceThreshold is the confidence below which the detected
+	// encoding is discarded in favor of the default one
+	detectionConfidenceThreshold = 80
 )
 
 type Line struct {
@@ -93,8 +105,16 @@ type Tail struct {
 	Config              // Tail.Configuration
 
 	file    *os.File
-	reader  *bufio.Reader
+	reader  lineReader
 	lineNum int
+
+	// detectedEncoding memoizes the encoding detected for the file currently
+	// open, so that reopening the reader (on a seek, for example) cannot change
+	// the encoding in the middle of the stream. It is reset when the file is
+	// reopened, so that a rotated file is examined again. An empty value means
+	// that no conclusion could be drawn yet, and that detection must be retried
+	// when the file has grown.
+	detectedEncoding string
 
 	lineBuf *strings.Builder
 
@@ -110,7 +130,7 @@ var (
 	// DefaultLogger logs to os.Stderr and it is used when Config.Logger == nil
 	DefaultLogger = log.New(os.Stderr, "", log.LstdFlags)
 	// DiscardingLogger can be used to disable logging output
-	DiscardingLogger = log.New(ioutil.Discard, "", 0)
+	DiscardingLogger = log.New(io.Discard, "", 0)
 )
 
 // TailFile begins tailing the file. And returns a pointer to a Tail struct
@@ -164,7 +184,10 @@ func TailFile(filename string, config Config) (*Tail, error) {
 	return t, nil
 }
 
-// Tell returns the file's current position, like stdio's ftell() and an error.
+// Tell returns the position of the consumer in the file, like stdio's ftell(),
+// and an error. It is the position at which the tailing can be resumed, and it
+// is reported for every line through Line.SeekInfo.
+//
 // Beware that this value may not be completely accurate because one line from
 // the chan(tail.Lines) may have been read already.
 func (tail *Tail) Tell() (offset int64, err error) {
@@ -182,7 +205,11 @@ func (tail *Tail) Tell() (offset int64, err error) {
 		return
 	}
 
-	offset -= int64(tail.reader.Buffered())
+	// The position of the file is ahead of the consumer by everything that has
+	// been read but not returned yet. For a file that is decoded, that includes
+	// the bytes held by the decoder, and it is counted in source bytes: the
+	// offset stays a position in the file, which is what a Location needs.
+	offset -= int64(tail.reader.PendingSourceBytes())
 	return
 }
 
@@ -219,6 +246,7 @@ func (tail *Tail) reopen() error {
 	}
 	tail.closeFile()
 	tail.lineNum = 0
+	tail.detectedEncoding = ""
 	for {
 		var err error
 		tail.file, err = OpenFile(tail.Filename)
@@ -300,15 +328,6 @@ func (tail *Tail) tailFileSync() {
 
 	// Read line by line.
 	for {
-		// do not seek in named pipes
-		if !tail.Pipe {
-			// grab the position in case we need to back up in the event of a half-line
-			if _, err := tail.Tell(); err != nil {
-				tail.Kill(err)
-				return
-			}
-		}
-
 		line, err := tail.readLine()
 
 		// Process `line` even if err is EOF.
@@ -340,10 +359,6 @@ func (tail *Tail) tailFileSync() {
 
 			if tail.Follow && line != "" {
 				tail.sendLine(line)
-				if err := tail.seekEnd(); err != nil {
-					tail.Kill(err)
-					return
-				}
 			}
 
 			// When EOF is reached, wait for more data to become
@@ -356,6 +371,8 @@ func (tail *Tail) tailFileSync() {
 				}
 				return
 			}
+
+			tail.retryEncodingDetection()
 		} else {
 			// non-EOF error
 			tail.Killf("Error reading %s: %s", tail.Filename, err)
@@ -421,52 +438,118 @@ func (tail *Tail) waitForChanges() error {
 
 func (tail *Tail) openReader() {
 	tail.lk.Lock()
-	transformReader := tail.getTransformReader()
+	defer tail.lk.Unlock()
+
+	if decoder, accountant := tail.newDecoders(); decoder != nil {
+		// A decoded file is not read through a bufio.Reader: the decoding reader
+		// splits the lines itself, which is what allows it to report a position
+		// in the file rather than in the decoded stream
+		tail.reader = newDecodingReader(tail.file, decoder, accountant)
+		return
+	}
+
 	if tail.MaxLineSize > 0 {
 		// add 2 to account for newline characters
-		tail.reader = bufio.NewReaderSize(transformReader, tail.MaxLineSize+2)
+		tail.reader = newBufferedLineReader(bufio.NewReaderSize(tail.file, tail.MaxLineSize+2))
 	} else {
-		tail.reader = bufio.NewReader(transformReader)
+		tail.reader = newBufferedLineReader(bufio.NewReader(tail.file))
 	}
-	tail.lk.Unlock()
 }
 
-func (tail *Tail) getTransformReader() io.Reader {
+// newDecoders returns the decoders the decoding reader needs, or nil when the
+// file is UTF-8 encoded, or cannot be decoded, and must be read as-is.
+//
+// Two identical decoders are returned: one decodes the file as it is read, the
+// other lags behind to count the source bytes of the lines that were returned.
+func (tail *Tail) newDecoders() (decoder, accountant transform.Transformer) {
 	encoding := tail.getEncoding()
-	if strings.ToUpper(encoding) == "UTF-8" {
+	if strings.ToUpper(encoding) == defaultEncoding {
 		// No need for a transformer
-		return tail.file
+		return nil, nil
 	}
+
 	encode, err := ianaindex.IANA.Encoding(encoding)
 	if err != nil || encode == nil {
-		return tail.file
+		tail.Logger.Printf("No decoder available for the %s encoding of %s, "+
+			"reading it as-is", encoding, tail.Filename)
+		if tail.Encoding == "" {
+			// The detection cannot give a better answer on the next open of the
+			// reader: stop detecting, and stop warning, until the file is reopened
+			tail.detectedEncoding = defaultEncoding
+		}
+		return nil, nil
 	}
-	reader := transform.NewReader(tail.file, encode.NewDecoder())
-	return reader
+
+	// BOMOverride drops the byte order mark of the file, if any, instead of
+	// decoding it as an U+FEFF character prepended to the first line. It also
+	// corrects the endianness when the mark disagrees with the given encoding.
+	return unicode.BOMOverride(encode.NewDecoder()), unicode.BOMOverride(encode.NewDecoder())
 }
 
 func (tail *Tail) getEncoding() string {
 	if tail.Encoding != "" {
 		return tail.Encoding
 	}
+	if tail.detectedEncoding != "" {
+		return tail.detectedEncoding
+	}
 	// Detect encoding
 	currentOffset, err := tail.file.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return "UTF-8"
+		return defaultEncoding
 	}
 	tail.file.Seek(0, io.SeekStart)
 	buf := make([]byte, 1024)
-	_, err = tail.file.Read(buf)
+	// A single Read may return less than the whole buffer, even on a large file
+	n, err := io.ReadFull(tail.file, buf)
 	tail.file.Seek(currentOffset, io.SeekStart)
-	if err != nil {
-		return "UTF-8"
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return defaultEncoding
+	}
+	if n < minimumDetectionSample {
+		// Too few bytes to conclude anything: the file has just been created or
+		// rotated. Stay on the default encoding, and leave the detection
+		// undecided so that it is retried when the file has grown.
+		return defaultEncoding
 	}
 	detector := chardet.NewTextDetector()
-	result, err := detector.DetectBest(buf)
-	if err != nil || result.Confidence < 80 {
-		return "UTF-8"
+	// Only the bytes actually read: the tail of the buffer is made of NUL bytes,
+	// which the detector confidently reports as UTF-32
+	result, err := detector.DetectBest(buf[:n])
+	if err != nil || result.Confidence < detectionConfidenceThreshold {
+		if n == len(buf) {
+			// A full sample was inconclusive: the beginning of the file will not
+			// look any different later, stop detecting
+			tail.detectedEncoding = defaultEncoding
+		}
+		return defaultEncoding
 	}
-	return result.Charset
+	tail.detectedEncoding = result.Charset
+	return tail.detectedEncoding
+}
+
+// retryEncodingDetection rebuilds the reader when the encoding of the file could
+// not be detected yet, typically because the file was empty, or only made of a
+// byte order mark, when the reader was opened. It gives the detection a new
+// chance before the data that has just been appended is read as UTF-8.
+//
+// This is only safe while the encoding is undecided: the file is then read
+// without any decoder, so no byte is held outside of the buffered reader, and an
+// empty buffer means the position of the file is exactly the position of the
+// consumer. Nothing is lost by rebuilding the reader.
+func (tail *Tail) retryEncodingDetection() {
+	if tail.Encoding != "" || tail.detectedEncoding != "" {
+		return
+	}
+
+	tail.lk.Lock()
+	pending := tail.reader.PendingSourceBytes()
+	tail.lk.Unlock()
+	if pending > 0 {
+		return
+	}
+
+	tail.openReader()
 }
 
 func (tail *Tail) seekEnd() error {
@@ -478,8 +561,9 @@ func (tail *Tail) seekTo(pos SeekInfo) error {
 	if err != nil {
 		return fmt.Errorf("Seek error on %s: %s", tail.Filename, err)
 	}
-	// Reset the read buffer whenever the file is re-seek'ed
-	tail.reader.Reset(tail.file)
+	// Rebuild the whole read chain whenever the file is re-seek'ed: resetting the
+	// buffered reader on the file would drop the decoder and return raw bytes
+	tail.openReader()
 	return nil
 }
 
