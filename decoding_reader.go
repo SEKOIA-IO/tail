@@ -41,6 +41,14 @@ type decodingReader struct {
 	// returned line was made of.
 	accountant transform.Transformer
 
+	// finalAtEOF tells that the file is not being followed, so the end of the
+	// file is the end of the data, and the transformers have to be told about it
+	finalAtEOF bool
+	// flushed tells that the transformers have been told that the end of the
+	// file was reached, which the accountant has to be told as well to stay in
+	// step with the decoder
+	flushed bool
+
 	readBuffer    []byte
 	decodeBuffer  []byte
 	accountBuffer []byte
@@ -58,11 +66,12 @@ type decodingReader struct {
 	searched int
 }
 
-func newDecodingReader(source io.Reader, decoder, accountant transform.Transformer) *decodingReader {
+func newDecodingReader(source io.Reader, decoder, accountant transform.Transformer, finalAtEOF bool) *decodingReader {
 	return &decodingReader{
 		source:        source,
 		decoder:       decoder,
 		accountant:    accountant,
+		finalAtEOF:    finalAtEOF,
 		readBuffer:    make([]byte, decodingBufferSize),
 		decodeBuffer:  make([]byte, decodingBufferSize),
 		accountBuffer: make([]byte, decodingBufferSize),
@@ -91,6 +100,16 @@ func (reader *decodingReader) ReadString(delim byte) (string, error) {
 		if err == nil {
 			err = io.EOF
 		}
+		if reader.finalAtEOF && !reader.flushed {
+			// Nothing more will ever be appended: tell the decoder, so that it
+			// hands over the bytes it was keeping back, and look for a delimiter
+			// in what it produces
+			reader.flushed = true
+			if flushErr := reader.flush(); flushErr != nil {
+				return "", flushErr
+			}
+			continue
+		}
 		// Like bufio.Reader, return the data read before the error: the caller
 		// decides what to do with a line that has no ending yet. The error is
 		// not memorized, so the reader resumes when the file grows again.
@@ -104,7 +123,7 @@ func (reader *decodingReader) decode() error {
 	for len(reader.undecoded) > 0 {
 		// atEOF is always false: the file is still being written, so an
 		// incomplete sequence means "the writer has not finished yet", it must
-		// not be flushed as an U+FFFD character
+		// not be flushed as a U+FFFD character
 		nDst, nSrc, err := reader.decoder.Transform(reader.decodeBuffer, reader.undecoded, false)
 		if nDst > 0 {
 			reader.decoded = append(reader.decoded, reader.decodeBuffer[:nDst]...)
@@ -126,6 +145,43 @@ func (reader *decodingReader) decode() error {
 				// The destination buffer cannot even hold a single character,
 				// which cannot happen with decodingBufferSize, but do not loop
 				// forever
+				return err
+			}
+		default:
+			return err
+		}
+	}
+
+	return nil
+}
+
+// flush decodes the bytes the decoder was keeping back, telling it that the end
+// of the file has been reached.
+//
+// A transformer is allowed to hold bytes for as long as it has not been told
+// that no more will come: unicode.BOMOverride, for example, holds the first two
+// bytes of a file while it decides whether they are the beginning of a byte
+// order mark, so a file of one or two bytes would never produce anything at all.
+// An incomplete character at the end of the file becomes a U+FFFD, which is what
+// tells the reader of the log that the file was truncated.
+func (reader *decodingReader) flush() error {
+	for len(reader.undecoded) > 0 {
+		nDst, nSrc, err := reader.decoder.Transform(reader.decodeBuffer, reader.undecoded, true)
+		if nDst > 0 {
+			reader.decoded = append(reader.decoded, reader.decodeBuffer[:nDst]...)
+		}
+		if nSrc > 0 {
+			reader.unaccounted = append(reader.unaccounted, reader.undecoded[:nSrc]...)
+			reader.undecoded = consume(reader.undecoded, nSrc)
+		}
+
+		switch err {
+		case nil, transform.ErrShortSrc:
+			// Either everything was decoded, or what is left cannot be decoded
+			// even at the end of the file: there is nothing more to get
+			return nil
+		case transform.ErrShortDst:
+			if nDst == 0 && nSrc == 0 {
 				return err
 			}
 		default:
@@ -171,7 +227,7 @@ func (reader *decodingReader) account(decodedCount int) {
 		}
 
 		nDst, nSrc, _ := reader.accountant.Transform(
-			reader.accountBuffer[:room], reader.unaccounted[consumed:], false)
+			reader.accountBuffer[:room], reader.unaccounted[consumed:], reader.flushed)
 		produced += nDst
 		consumed += nSrc
 

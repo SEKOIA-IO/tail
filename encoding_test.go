@@ -5,6 +5,7 @@ package tail
 import (
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -206,7 +207,7 @@ func TestUTF8IsNotDecoded(t *testing.T) {
 }
 
 // TestBOMIsNotPartOfTheFirstLine checks that the byte order mark of a file is
-// not decoded as an U+FEFF character prepended to its first line.
+// not decoded as a U+FEFF character prepended to its first line.
 func TestBOMIsNotPartOfTheFirstLine(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -236,6 +237,217 @@ func TestBOMIsNotPartOfTheFirstLine(t *testing.T) {
 			}
 			if line != "hello" {
 				t.Fatalf("expecting <<<hello>>>, but got <<<%s>>> (bytes: %v)", line, []byte(line))
+			}
+		})
+	}
+}
+
+// TestUTF8BOMIsNotPartOfTheFirstLine checks that the byte order mark of an UTF-8
+// file, which Windows editors and PowerShell write, is discarded as well. Such a
+// file is read as-is, without any decoder, so it does not benefit from
+// unicode.BOMOverride.
+func TestUTF8BOMIsNotPartOfTheFirstLine(t *testing.T) {
+	for _, encoding := range []string{"", "UTF-8"} {
+		name := "detected"
+		if encoding != "" {
+			name = "explicit"
+		}
+		t.Run(name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("utf8-bom-"+name, t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log", append(utf8BOM, []byte("hello\nwörld\n")...))
+			tail := newUnstartedTail(t, tailTest.path+"/test.log", Config{Encoding: encoding})
+			tail.openReader()
+
+			line, err := tail.readLine()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if line != "hello" {
+				t.Fatalf("expecting <<<hello>>>, but got <<<%s>>> (bytes: %v)", line, []byte(line))
+			}
+
+			// The mark counts as read: it is part of the file, only not of its lines
+			offset, err := tail.Tell()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if expected := int64(len(utf8BOM) + len("hello\n")); offset != expected {
+				t.Fatalf("expecting an offset of %d after the first line, but got %d", expected, offset)
+			}
+
+			if line, err = tail.readLine(); err != nil || line != "wörld" {
+				t.Fatalf("expecting <<<wörld>>>, but got <<<%s>>> (error: %v)", line, err)
+			}
+		})
+	}
+}
+
+// TestUTF8WithoutBOMLosesNothing checks that the byte order mark detection does
+// not eat the first bytes of a file that does not start with one, including when
+// the file is too short to even hold a mark.
+func TestUTF8WithoutBOMLosesNothing(t *testing.T) {
+	testCases := []struct {
+		name     string
+		content  string
+		expected string
+	}{
+		{"ordinary file", "hello\n", "hello"},
+		{"file shorter than a mark", "a\n", "a"},
+		{"file starting like a mark", "\xef\xbbhello\n", "\xef\xbbhello"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("utf8-no-bom", t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log", []byte(testCase.content))
+			tail := newUnstartedTail(t, tailTest.path+"/test.log", Config{Encoding: "UTF-8"})
+			tail.openReader()
+
+			line, err := tail.readLine()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if line != testCase.expected {
+				t.Fatalf("expecting <<<%s>>>, but got <<<%s>>> (bytes: %v)",
+					testCase.expected, line, []byte(line))
+			}
+		})
+	}
+}
+
+// TestMarkLikeBytesAreKeptWhenResuming checks that bytes that look like a byte
+// order mark are treated as ordinary content when the reader is built further in
+// the file, which is what happens every time the tailing resumes at a stored
+// offset.
+//
+// Dropping them would lose a character, and, worse, the mark of an encoding that
+// is not the one of the file switches the decoder for all the rest of the file:
+// the ISO-8859-1 case below decodes as UTF-16LE, which turns every line into
+// mojibake and, since a misaligned UTF-16 stream contains no line ending, makes
+// the file go silent.
+func TestMarkLikeBytesAreKeptWhenResuming(t *testing.T) {
+	testCases := []struct {
+		name     string
+		encoding string
+		content  []byte
+		resume   int64
+		expected string
+	}{
+		{
+			name:     "utf16le",
+			encoding: "UTF-16LE",
+			content:  encodeUTF16(t, "hello\n\ufeffworld\n", unicode.LittleEndian, true),
+			// The mark of the file, then the first line, two bytes per character
+			resume:   2 + int64(len("hello\n")*2),
+			expected: "\ufeffworld",
+		},
+		{
+			name:     "iso-8859-1",
+			encoding: "ISO-8859-1",
+			content:  encodeLatin1(t, "hello\n\u00ff\u00ferest of the file\n"),
+			resume:   int64(len("hello\n")),
+			expected: "\u00ff\u00ferest of the file",
+		},
+		{
+			name:     "utf8",
+			encoding: "UTF-8",
+			content:  append([]byte("hello\n"), append(utf8BOM, []byte("world\n")...)...),
+			resume:   int64(len("hello\n")),
+			expected: "\ufeffworld",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("resume-mark-like", t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log", testCase.content)
+
+			// Through the Location of the configuration, the way a consumer
+			// resumes where a previous run of the tail stopped
+			tail := tailTest.StartTail("test.log", Config{
+				Follow:   true,
+				Poll:     true,
+				Encoding: testCase.encoding,
+				Location: &SeekInfo{Offset: testCase.resume, Whence: io.SeekStart},
+			})
+
+			expectLine(t, tail, testCase.expected)
+
+			tailTest.RemoveFile("test.log")
+			tail.Stop()
+			tail.Cleanup()
+		})
+	}
+}
+
+// TestFileThatIsNotFollowedIsFullyDecoded checks that the bytes a transformer
+// keeps back are decoded when the end of the file is the end of the data.
+//
+// A transformer is allowed to hold bytes for as long as it has not been told
+// that no more will come. unicode.BOMOverride holds the first two bytes of a
+// file while it decides whether they begin a byte order mark, so a file of one
+// or two bytes used to produce nothing at all: the reader returned an empty EOF
+// and the tailing ended, silently dropping the whole file.
+func TestFileThatIsNotFollowedIsFullyDecoded(t *testing.T) {
+	testCases := []struct {
+		name     string
+		encoding string
+		content  []byte
+		expected []string
+		offsets  []int64
+	}{
+		{
+			name:     "shorter than a byte order mark",
+			encoding: "ISO-8859-1",
+			content:  encodeLatin1(t, "a\n"),
+			expected: []string{"a"},
+			offsets:  []int64{2},
+		},
+		{
+			name:     "shorter than a byte order mark, without a line ending",
+			encoding: "ISO-8859-1",
+			content:  encodeLatin1(t, "ab"),
+			expected: []string{"ab"},
+			offsets:  []int64{2},
+		},
+		{
+			// The replacement character is what tells the reader of the log that
+			// the file ends in the middle of a character
+			name:     "truncated in the middle of a character",
+			encoding: "UTF-16LE",
+			content:  append(encodeUTF16(t, "hello\n", unicode.LittleEndian, true), 0x41),
+			expected: []string{"hello", "\ufffd"},
+			offsets:  []int64{14, 15},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("not-followed", t)
+			defer cleanup()
+
+			tailTest.CreateFileBytes("test.log", testCase.content)
+			tail := tailTest.StartTail("test.log", Config{
+				Follow: false, Encoding: testCase.encoding,
+			})
+			defer tail.Cleanup()
+
+			lines, offsets := collectLines(t, tail, len(testCase.expected))
+			if !reflect.DeepEqual(lines, testCase.expected) {
+				t.Fatalf("expecting %q, but got %q", testCase.expected, lines)
+			}
+			// The flush must not desynchronize the accountant from the decoder
+			if !reflect.DeepEqual(offsets, testCase.offsets) {
+				t.Fatalf("expecting the offsets %v, but got %v", testCase.offsets, offsets)
+			}
+			if _, ok := <-tail.Lines; ok {
+				t.Fatal("expecting the tailing to be over")
 			}
 		})
 	}
@@ -362,6 +574,46 @@ func TestGetEncodingStopsRetryingOnAFullSample(t *testing.T) {
 	}
 	if tail.detectedEncoding != "UTF-8" {
 		t.Fatalf("expecting the detection to be settled, but got %q", tail.detectedEncoding)
+	}
+}
+
+// TestFollowFileWithATornBOM checks that a file caught while its byte order mark
+// is only half written is not read as UTF-8 in the meantime.
+//
+// The single byte cannot be decoded, and it cannot be un-read either: consuming
+// it would leave the decoder that the detection ends up choosing one byte out of
+// phase for the whole file, which produces mojibake with incomplete lines and,
+// because a misaligned UTF-16 stream never contains 0x0A 0x00, no line at all
+// with complete lines.
+func TestFollowFileWithATornBOM(t *testing.T) {
+	for _, completeLines := range []bool{false, true} {
+		name := "incomplete-lines"
+		if completeLines {
+			name = "complete-lines"
+		}
+		t.Run(name, func(t *testing.T) {
+			tailTest, cleanup := NewTailTest("torn-bom", t)
+			defer cleanup()
+
+			// The writer has only managed to write the first byte of the mark
+			tailTest.CreateFileBytes("test.log", []byte{0xFF})
+			tail := tailTest.StartTail("test.log", Config{
+				Follow: true, Poll: true, CompleteLines: completeLines,
+			})
+
+			settle()
+			// ...then it finishes the mark and writes two lines
+			rest := append([]byte{0xFE},
+				encodeUTF16(t, "hello\nworld\n", unicode.LittleEndian, false)...)
+			tailTest.AppendFileBytes("test.log", rest)
+
+			expectLine(t, tail, "hello")
+			expectLine(t, tail, "world")
+
+			tailTest.RemoveFile("test.log")
+			tail.Stop()
+			tail.Cleanup()
+		})
 	}
 }
 

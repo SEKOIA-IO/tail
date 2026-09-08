@@ -6,9 +6,14 @@ followed file reached EOF, its decoder was "complete" and never read the file
 again, so everything appended afterwards was silently ignored until the file was
 reopened. Decoding is now done by a resumable reader that keeps its pending
 bytes across EOF.
-* Drop the byte order mark of a file instead of decoding it as an U+FEFF
+* Drop the byte order mark of a file instead of decoding it as a U+FEFF
 character prepended to its first line. When it disagrees with the configured
-encoding, the mark now also corrects the endianness.
+encoding, the mark now also corrects the endianness. This covers UTF-8 files,
+which Windows tools mark even though UTF-8 has a single byte order. Only the
+start of the file is examined: the reader is rebuilt on every seek and reopen,
+and mark-like bytes found where the tailing resumes are ordinary content, which
+dropping would lose, and which would otherwise be able to switch the decoder for
+the whole rest of the file.
 * Keep decoding after a seek. Seeking used to reset the buffered reader on the
 file itself, dropping the decoder, so every line read afterwards was made of raw
 undecoded bytes.
@@ -27,6 +32,15 @@ the file as UTF-8 until it is reopened. A file that is empty when it is opened
 cannot be identified, so its first lines used to be shipped as raw undecoded
 bytes. The detection is now retried when the file grows, and it settles for good
 once a full sample has been examined.
+* Hold the reading of a file that is still too short for its encoding to be
+detected, instead of reading its first bytes as UTF-8. A file caught while its
+byte order mark is only half written used to have that byte consumed, which left
+the decoder chosen afterwards one byte out of phase for the rest of the file:
+every line was mojibake, and, since a misaligned UTF-16 stream never contains a
+line ending, the file went silent altogether when complete lines were enabled.
+For the same reason, the detection is no longer allowed to change its mind once
+something has been read: a file whose beginning has been read as UTF-8 keeps
+being read as UTF-8.
 * Remove the position lookup that was performed, and discarded, before every
 line, which costs a system call per line.
 * Stop reporting a file that cannot be opened as a deleted file on Windows.
@@ -44,6 +58,15 @@ persisting it and seeking back to it on the next start would skip data, or land
 in the middle of a character. The decoding reader now splits the lines itself
 and replays the decoding of what it returns, through a second decoder that lags
 behind, which gives the exact number of source bytes each line was made of.
+* Decode the bytes the decoder keeps back when the file is not being followed.
+A transformer may hold bytes for as long as it has not been told that no more
+will come, and `unicode.BOMOverride` holds the first two bytes of a file while
+it decides whether they begin a byte order mark: a file of one or two bytes
+produced nothing at all, and a file truncated in the middle of a character lost
+its last character. Reading a file that is not followed now ends by telling the
+decoder that the end of the file has been reached, which also turns a truncated
+character into the U+FFFD that reports it. Nothing changes for a followed file,
+where the end of the file only means that the writer has not finished yet.
 * Small cleanups: unreachable statements in the watchers, and `io/ioutil`.
 
 # Version v1.4.9

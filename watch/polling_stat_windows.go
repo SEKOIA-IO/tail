@@ -23,7 +23,7 @@ func statFile(name string) (os.FileInfo, error) {
 		defer f.Close()
 		return f.Stat()
 	}
-	if !os.IsPermission(err) {
+	if os.IsNotExist(err) {
 		return nil, err
 	}
 

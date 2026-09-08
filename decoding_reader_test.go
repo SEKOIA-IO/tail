@@ -65,7 +65,7 @@ func utf16LEDecodersWithBOM() (transform.Transformer, transform.Transformer) {
 
 func newUTF16LEReader(source io.Reader) *decodingReader {
 	decoder, accountant := utf16LEDecoders()
-	return newDecodingReader(source, decoder, accountant)
+	return newDecodingReader(source, decoder, accountant, false)
 }
 
 // TestDecodingReaderResumesAfterEOF is the core of the fix: unlike
@@ -125,7 +125,7 @@ func TestDecodingReaderWithByteSizedReads(t *testing.T) {
 func TestDecodingReaderDropsBOM(t *testing.T) {
 	source := &growingReader{data: encodeUTF16(t, "hello\n", unicode.LittleEndian, true)}
 	decoder, accountant := utf16LEDecodersWithBOM()
-	reader := newDecodingReader(source, decoder, accountant)
+	reader := newDecodingReader(source, decoder, accountant, false)
 
 	if decoded := readLinesUntilEOF(t, reader); decoded != "hello\n" {
 		t.Fatalf("expecting <<<hello\\n>>> without a BOM, but got <<<%s>>> (bytes: %v)",
@@ -138,7 +138,7 @@ func TestDecodingReaderDropsBOM(t *testing.T) {
 func TestDecodingReaderCorrectsEndianness(t *testing.T) {
 	source := &growingReader{data: encodeUTF16(t, "hello\n", unicode.BigEndian, true)}
 	decoder, accountant := utf16LEDecodersWithBOM()
-	reader := newDecodingReader(source, decoder, accountant)
+	reader := newDecodingReader(source, decoder, accountant, false)
 
 	if decoded := readLinesUntilEOF(t, reader); decoded != "hello\n" {
 		t.Fatalf("expecting <<<hello\\n>>>, but got <<<%s>>> (bytes: %v)", decoded, []byte(decoded))
@@ -198,7 +198,7 @@ func TestDecodingReaderAccountsForSourceBytes(t *testing.T) {
 			bomLength := len(encodeUTF16(t, "", unicode.LittleEndian, testCase.bom))
 			source := &growingReader{data: encoded}
 			decoder, accountant := utf16LEDecodersWithBOM()
-			reader := newDecodingReader(source, decoder, accountant)
+			reader := newDecodingReader(source, decoder, accountant, false)
 
 			returned := ""
 			for _, expected := range splitLines(testCase.text) {
@@ -247,7 +247,7 @@ func BenchmarkDecodingReader(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		decoder, accountant := utf16LEDecodersWithBOM()
-		reader := newDecodingReader(&growingReader{data: encoded}, decoder, accountant)
+		reader := newDecodingReader(&growingReader{data: encoded}, decoder, accountant, false)
 		for {
 			_, err := reader.ReadString('\n')
 			if err == io.EOF {
