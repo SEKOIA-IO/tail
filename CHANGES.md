@@ -1,3 +1,74 @@
+# Version v1.6.5
+
+* Fix the tailing of files that are not UTF-8 encoded. `transform.Reader`, used
+to decode them, latches the first error of the underlying reader: once a
+followed file reached EOF, its decoder was "complete" and never read the file
+again, so everything appended afterwards was silently ignored until the file was
+reopened. Decoding is now done by a resumable reader that keeps its pending
+bytes across EOF.
+* Drop the byte order mark of a file instead of decoding it as a U+FEFF
+character prepended to its first line. When it disagrees with the configured
+encoding, the mark now also corrects the endianness. This covers UTF-8 files,
+which Windows tools mark even though UTF-8 has a single byte order. Only the
+start of the file is examined: the reader is rebuilt on every seek and reopen,
+and mark-like bytes found where the tailing resumes are ordinary content, which
+dropping would lose, and which would otherwise be able to switch the decoder for
+the whole rest of the file.
+* Keep decoding after a seek. Seeking used to reset the buffered reader on the
+file itself, dropping the decoder, so every line read afterwards was made of raw
+undecoded bytes.
+* Only feed the bytes actually read to the encoding detection. The rest of the
+1024 bytes buffer was NUL padding, which the detector confidently reports as
+UTF-32: a freshly rotated UTF-16 file, which only contains a byte order mark,
+was detected as UTF-32LE and decoded as garbage. Detection is now also skipped
+when the sample is too small to conclude anything, and its result is memoized
+until the file is reopened.
+* Stop seeking to the end of the file after an incomplete line has been read.
+The seek was either a no-op, when nothing had been appended since the read, or
+a silent loss of everything the writer appended in between. The tailing now
+simply resumes where the incomplete line ends.
+* Retry the encoding detection when it could not conclude, instead of reading
+the file as UTF-8 until it is reopened. A file that is empty when it is opened
+cannot be identified, so its first lines used to be shipped as raw undecoded
+bytes. The detection is now retried when the file grows, and it settles for good
+once a full sample has been examined.
+* Hold the reading of a file that is still too short for its encoding to be
+detected, instead of reading its first bytes as UTF-8. A file caught while its
+byte order mark is only half written used to have that byte consumed, which left
+the decoder chosen afterwards one byte out of phase for the rest of the file:
+every line was mojibake, and, since a misaligned UTF-16 stream never contains a
+line ending, the file went silent altogether when complete lines were enabled.
+For the same reason, the detection is no longer allowed to change its mind once
+something has been read: a file whose beginning has been read as UTF-8 keeps
+being read as UTF-8.
+* Remove the position lookup that was performed, and discarded, before every
+line, which costs a system call per line.
+* Stop reporting a file that cannot be opened as a deleted file on Windows.
+Since the polling watcher stats through an open handle, an open that fails
+because a writer uses a restrictive sharing mode, or because an antivirus or a
+backup holds the file for a moment, was read as a deletion: the tail reopened
+the file and shipped its whole content again. The directory entry is now
+checked before concluding anything, and the failures that remain go through the
+existing tolerance of consecutive polling errors.
+* Report the position of the consumer in the file for every line, whatever the
+encoding of the file is. `SeekInfo.Offset` used to be computed by subtracting a
+number of decoded bytes from the position of the file, and it ignored the bytes
+held by the decoder, so it was meaningless for a file that is not UTF-8 encoded:
+persisting it and seeking back to it on the next start would skip data, or land
+in the middle of a character. The decoding reader now splits the lines itself
+and replays the decoding of what it returns, through a second decoder that lags
+behind, which gives the exact number of source bytes each line was made of.
+* Decode the bytes the decoder keeps back when the file is not being followed.
+A transformer may hold bytes for as long as it has not been told that no more
+will come, and `unicode.BOMOverride` holds the first two bytes of a file while
+it decides whether they begin a byte order mark: a file of one or two bytes
+produced nothing at all, and a file truncated in the middle of a character lost
+its last character. Reading a file that is not followed now ends by telling the
+decoder that the end of the file has been reached, which also turns a truncated
+character into the U+FFFD that reports it. Nothing changes for a followed file,
+where the end of the file only means that the writer has not finished yet.
+* Small cleanups: unreachable statements in the watchers, and `io/ioutil`.
+
 # Version v1.4.9
 * Bump fsnotify to v1.5.1 fixes issue #28, hpcloud/tail#90.
 * PR #27: "Add timeout to tests"by @kokes++. Also timeout on FreeBSD.
@@ -58,4 +129,3 @@ release to 1.9.
 * migration to go modules.
 * release of master branch of the dormant upstream, because it contains
 fixes and improvement no present in the tagged release.
-

@@ -6,7 +6,6 @@ package watch
 
 import (
 	"os"
-	"runtime"
 	"time"
 
 	"github.com/SEKOIA-IO/tail/util"
@@ -40,7 +39,6 @@ func (fw *PollingFileWatcher) BlockUntilExists(t *tomb.Tomb) error {
 			return tomb.ErrDying
 		}
 	}
-	panic("unreachable")
 }
 
 // Number of consecutive failed polls tolerated before the file is reported as
@@ -76,9 +74,7 @@ func (fw *PollingFileWatcher) ChangeEvents(t *tomb.Tomb, pos int64) (*FileChange
 			time.Sleep(POLL_DURATION)
 			fi, err := statFile(fw.Filename)
 			if err != nil {
-				// Windows cannot delete a file if a handle is still open (tail keeps one open)
-				// so it gives access denied to anything trying to read it until all handles are released.
-				if os.IsNotExist(err) || (runtime.GOOS == "windows" && os.IsPermission(err)) {
+				if os.IsNotExist(err) {
 					// File does not exist (has been deleted).
 					changes.NotifyDeleted()
 					return
